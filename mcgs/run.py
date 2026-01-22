@@ -187,7 +187,6 @@ for index, row in conditions_df.iterrows():
                 "time": times,
                 "prevalence": infection_prevalence,
                 "incidence": infection_incidence,
-                "initial_conditions": initial_conditions,
             }
         )
 

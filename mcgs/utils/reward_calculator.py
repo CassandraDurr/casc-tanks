@@ -54,7 +54,6 @@ class RewardCalculator:
         system_structure: dict,
         state_keys: list[str],
         time_array: np.ndarray,
-        initial_conditions_matrix: np.ndarray,
         prevalence: np.ndarray,
         incidence: np.ndarray,
         n_term: str = "max",
@@ -66,7 +65,6 @@ class RewardCalculator:
             system_structure: Stoichiometry matrix
             state_keys: List of state variable names (e.g., ['s', 'i', 'r'])
             time_array: Shape (num_times,)
-            initial_conditions_matrix: Shape (3, num_realisations)
             prevalence: Infection prevalence data, Shape (num_times, num_realisations)
             incidence: Infection incidence data, Shape (num_times-1, num_realisations)
             n_term: Choose between "max" and "avg" for parsimony calculation
@@ -74,6 +72,10 @@ class RewardCalculator:
         self.eta = eta
         self.n_term = n_term
         self.state_variables = {s, i, r}
+
+        # Number of states and realisations
+        self.num_states = len(state_keys)
+        self.num_realisations = prevalence.shape[1]
 
         # System structure
         self.system_structure = system_structure
@@ -83,7 +85,6 @@ class RewardCalculator:
         self.prevalence = prevalence
         self.incidence = incidence
         self.time_array = time_array
-        self.initial_conditions_matrix = initial_conditions_matrix
 
         # Thread safety
         self.lock = threading.Lock()
@@ -131,7 +132,7 @@ class RewardCalculator:
                 if not expr.free_symbols.intersection(self.state_variables):
                     # This flux is invalid and should use at least one state variable.
                     if return_details:
-                        return 0.0, ([], [])
+                        return 0.0, ([], [], [])
                     return 0.0
 
             # Constant folding: turn messy expressions into neat expressions
@@ -161,9 +162,12 @@ class RewardCalculator:
             # Check if we have already evaluated these set of equations
             with self.lock:
                 if cache_key in self.reward_cache:
-                    c_reward, (c_exprs, c_strs) = self.reward_cache[cache_key]
+                    c_reward, (c_exprs, c_strs, c_initial_conditions) = (
+                        self.reward_cache[cache_key]
+                    )
+
                     if return_details:
-                        return c_reward, (c_exprs, c_strs)
+                        return c_reward, (c_exprs, c_strs, c_initial_conditions)
                     return c_reward
 
             # Build the full system equations from fluxes and system structure
@@ -175,9 +179,9 @@ class RewardCalculator:
                         state_eq += flux_coeff * folded_flux_exprs[idx]
                 system_eqs[state_key] = state_eq
 
-            # Find the optimal constants and the resulting RMSE
-            best_total_error, optimal_const_values = self.optimise_constants(
-                system_eqs, all_consts
+            # Find the optimal constants, optimal initial conditions, and the resulting RMSE
+            best_total_error, optimal_const_values, optimal_initial_conditions = (
+                self.optimise_param(system_eqs, all_consts)
             )
 
             # Calculate parsimony-penalised reward
@@ -202,34 +206,43 @@ class RewardCalculator:
             with self.lock:
                 self.reward_cache[cache_key] = (
                     reward,
-                    (folded_flux_exprs, final_flux_strs),
+                    (folded_flux_exprs, final_flux_strs, optimal_initial_conditions),
                 )
 
             if return_details:
                 # Also return details of the equation form
-                return reward, (folded_flux_exprs, final_flux_strs)
+                return reward, (
+                    folded_flux_exprs,
+                    final_flux_strs,
+                    optimal_initial_conditions,
+                )
             return reward
 
         except Exception as e:
             print(f"Reward exception: {e}")
             if return_details:
-                return 0.0, ([], [])
+                return 0.0, ([], [], [])
             return 0.0
 
-    def optimise_constants(
+    def optimise_param(
         self,
         system_eqs: dict[str, sympy.Expr],
         consts: list[sympy.Symbol],
-    ) -> tuple[float, np.ndarray]:
+    ) -> tuple[float, np.ndarray, np.ndarray]:
         """
-        Find the optimal values for constants to minimise error.
+        Find the optimal values for constants and initial conditions to minimise error.
+
+        NOTE: The initial values for the initial conditions will need to change for cascading tanks.
+        Also, the bounds will also need to be specified for the new problem.
 
         Returns:
-            tuple[float, np.ndarray]: (best_rmse, optimal_const_values)
+            tuple[float, np.ndarray, np.ndarray]:
+            (best_rmse, optimal_const_values, optimal_initial_conditions)
+                - best_rmse: float, the minimum error achieved
+                - optimal_const_values: shape (num_consts,)
+                - optimal_initial_conditions: shape (num_states, num_realisations)
         """
-        num_consts = len(consts)
-
-        # Lambdify all system equations (dict of symbolic expressions -> dict of callable functions)
+        # Lambdify all system equations
         # Functions are per state (not flux)
         lambdified_eqs = {}
         for state_key, eq_expr in system_eqs.items():
@@ -237,71 +250,103 @@ class RewardCalculator:
                 [s, i, r] + consts, eq_expr, modules="numpy"
             )
 
+        # Total parameters
+        num_consts = len(consts)
+        num_init_conds = self.num_states * self.num_realisations
+        total_params = num_consts + num_init_conds
+
+        # Starting optimisation co-ordinates
+        x0 = np.zeros(total_params)
+        x0[:num_consts] = 0.01  # constants
+
+        # Starting optimisation co-ords for initial conditions
+        # TODO: This needs to change when we want to move towards the cascading tanks setup
+        initial_s = 1.0 - self.prevalence[0, :]  # Initial susceptibles
+        initial_i = self.prevalence[0, :]  # Initial infected
+        initial_r = 0.0 * np.ones(self.num_realisations)  # Initial recovered
+
+        for real_idx in range(self.num_realisations):
+            # Check normalisation
+            total = initial_s[real_idx] + initial_i[real_idx] + initial_r[real_idx]
+            if not np.isclose(total, 1.0):
+                print(f"Warning: Initial conditions do not sum to 1. Received {total}.")
+                initial_s[real_idx] /= total
+                initial_i[real_idx] /= total
+                initial_r[real_idx] /= total
+            base_idx = num_consts + real_idx * self.num_states
+            x0[base_idx] = initial_s[real_idx]
+            x0[base_idx + 1] = initial_i[real_idx]
+            x0[base_idx + 2] = initial_r[real_idx]
+
+        # Bounds: Reasonable constant bounds & initial conditions in (0,1)
+        bounds = [(-10.0, 10.0)] * num_consts
+        for _ in range(self.num_realisations):
+            bounds.extend([(0.0, 1.0)] * self.num_states)
+
         # Arguments for the objective function
         args_tuple = (
             lambdified_eqs,
             self.prevalence,
             self.incidence,
             self.time_array,
-            self.initial_conditions_matrix,
+            num_consts,
         )
 
-        # Handle case with no constants
-        if num_consts == 0:
-            # Just evaluate the expression directly
-            error = self.objective_function(np.array([]), *args_tuple)
-            return error, np.array([])
-
-        # Find the optimal constants
-        starting_guesses = [0.001, 0.01, 0.1]
+        # Optimise
         best_total_error = math.inf
         optimal_const_values = np.array([])
+        optimal_initial_conditions = np.array([])
 
-        for start_val in starting_guesses:
-            x0 = np.full(num_consts, start_val)
+        res = minimize(
+            self.objective_function,
+            x0,
+            args=args_tuple,
+            method="L-BFGS-B",
+            bounds=bounds,
+            options={"maxiter": 1000, "ftol": 1e-6},
+        )
 
-            try:
-                # Minimise objective using start_val for constants
-                res = minimize(
-                    self.objective_function,
-                    x0,
-                    args=args_tuple,
-                    method="Powell",
-                    tol=1e-4,
-                )
+        if res.success:
+            best_total_error = res.fun
+            optimal_params = res.x
+            optimal_const_values = optimal_params[:num_consts]
+            optimal_initial_conditions = optimal_params[num_consts:]
+        else:
+            raise ValueError(f"Optimisation failed: {res.message, res}")
 
-                # If this attempt is better than previous ones, save it
-                if res.fun < best_total_error:
-                    best_total_error = res.fun
-                    optimal_const_values = res.x
+        # Reshape optimal initial conditions to (num_states, num_realisations)
+        optimal_initial_conditions = optimal_initial_conditions.reshape(
+            self.num_realisations, self.num_states
+        ).T
 
-            except Exception:
-                continue
+        return best_total_error, optimal_const_values, optimal_initial_conditions
 
-        # If all attempts failed, return high penalty
-        if best_total_error == math.inf:
-            return 1e6, np.array([0.01] * num_consts)
-
-        return best_total_error, optimal_const_values
-
-    @staticmethod
     def objective_function(
-        c_values: np.ndarray,
+        self,
+        params: np.ndarray,
         lambdified_eqs: dict,
         prevalence: np.ndarray,  # Shape (num_times, num_realisations)
         incidence: np.ndarray,  # Shape (num_times-1, num_realisations)
         time_array: np.ndarray,  # Shape (num_times,)
-        initial_conditions_matrix: np.ndarray,  # Shape (3, num_realisations)
+        num_consts: int,
     ) -> float:
         """
-        MSE calculation using incidence and prevalence data.
+        Objective function used in optimising constants and initial conditions.
 
+        MSE calculation uses incidence and prevalence data.
         MSE per realisation = MSE(prevalence) + MSE(incidence).
 
         Returns the average MSE over all realisations.
         """
-        c_args = tuple(c_values)
         failure_penalty = 1e6
+
+        # Split parameters
+        c_values = params[:num_consts]
+        c_args = tuple(c_values)
+        flat_init_conds = params[num_consts:]
+        initial_conditions_matrix = flat_init_conds.reshape(
+            self.num_realisations, self.num_states
+        ).T  # shape (num_states, num_realisations)
 
         # Create a callable function for the ODE solver
         ode_func = lambda t_val, y_val, *args: sympy_ode(  # noqa: E731
@@ -310,7 +355,7 @@ class RewardCalculator:
 
         try:
             # Solve ODEs for all realisations at once
-            # Returns tensor of shape: (num_times, 3, num_realisations)
+            # Returns tensor of shape: (num_times, num_states, num_realisations)
             pred_traj_tensor = euler_method(
                 func=ode_func,
                 initial_conditions_matrix=initial_conditions_matrix,

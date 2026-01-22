@@ -441,13 +441,13 @@ class SymbolicNode:
                 )
 
         # Calculate reward and the equation details
-        reward, (flux_exprs, final_flux_strs) = (
+        reward, (flux_exprs, final_flux_strs, optimal_initial_conditions) = (
             self.graph.reward_calculator.calculate_reward(
                 flux_action_lists=flux_action_lists, return_details=True
             )
         )
 
-        return reward, (flux_exprs, final_flux_strs)
+        return reward, (flux_exprs, final_flux_strs, optimal_initial_conditions)
 
     def rollout_take_action(
         self,

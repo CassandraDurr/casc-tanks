@@ -81,7 +81,6 @@ class MCGS:
             system_structure=self.system_structure,
             state_keys=self.state_keys,
             time_array=self.time_array,
-            initial_conditions_matrix=self.initial_conditions_matrix,
             prevalence=self.true_prevalence,
             incidence=self.true_incidence,
         )
@@ -98,10 +97,6 @@ class MCGS:
         """Vectorise time, data, and intial conditions for multiple replications."""
         # Time vector: assumption = realisations share the same time steps.
         self.time_array = data_X[0]["time"]
-
-        # Initial conditions matrix: shape (num_states, num_realisations)
-        initial_conditions = [np.array(data["initial_conditions"]) for data in data_X]
-        self.initial_conditions_matrix = np.vstack(initial_conditions).T
 
         # Prevalence
         self.true_prevalence = np.stack(
